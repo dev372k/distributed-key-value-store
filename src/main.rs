@@ -116,7 +116,7 @@ async fn main() {
     // Replica configuration
     let replicas = if port == 3030 {
         // vec!["http://127.0.0.1:3031".to_string()]
-        vec!["3.238.88.60:3031".to_string()]
+        vec!["http://3.238.88.60:3031".to_string()]
     } else {
         // vec!["http://127.0.0.1:3030".to_string()]
         vec!["3.229.120.130:3030".to_string()]
