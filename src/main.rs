@@ -119,7 +119,7 @@ async fn main() {
         vec!["http://3.238.88.60:3031".to_string()]
     } else {
         // vec!["http://127.0.0.1:3030".to_string()]
-        vec!["3.229.120.130:3030".to_string()]
+        vec!["http://3.229.120.130:3030".to_string()]
     };
 
     let kv = KvStore::new(&log_file, replicas);
