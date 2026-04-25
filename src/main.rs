@@ -20,17 +20,16 @@ struct KvStore {
     log_file: String,
     nodes: Vec<String>,
     port: u16,
-    node_address: String, // ✅ FIXED
+    node_address: String,
 }
 
 impl KvStore {
-    fn new(log_file: &str, nodes: Vec<String>, port: u16) -> Self {
-        let node_address = nodes
-            .iter()
-            .find(|n| n.ends_with(&format!(":{}", port)))
-            .expect("Node address not found")
-            .clone();
-
+    fn new(
+        log_file: &str,
+        nodes: Vec<String>,
+        port: u16,
+        node_address: String,
+    ) -> Self {
         let kv = KvStore {
             store: Arc::new(Mutex::new(HashMap::new())),
             log_file: log_file.to_string(),
@@ -50,6 +49,7 @@ impl KvStore {
 
             for line in reader.lines().flatten() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
+
                 if parts.len() == 4 && parts[0] == "PUT" {
                     let ts: u128 = parts[3].parse().unwrap_or(0);
                     store.insert(parts[1].to_string(), (parts[2].to_string(), ts));
@@ -129,9 +129,31 @@ impl KvStore {
         }
     }
 
-    fn get(&self, key: String) -> Option<String> {
-        let store = self.store.lock().unwrap();
-        store.get(&key).map(|(v, _)| v.clone())
+    // ✅ FIXED GET (quorum-style read: latest timestamp wins)
+    async fn get(&self, key: String) -> Option<String> {
+        let nodes = self.find_nodes(&key);
+
+        let mut best_value: Option<String> = None;
+        let mut best_ts: u128 = 0;
+
+        for node in nodes {
+            let url = format!("{}/internal_get?key={}", node, key);
+
+            if let Ok(resp) = reqwest::get(&url).await {
+                if let Ok(text) = resp.text().await {
+                    if let Some((value, ts)) = text.split_once("|") {
+                        let ts: u128 = ts.parse().unwrap_or(0);
+
+                        if ts > best_ts {
+                            best_ts = ts;
+                            best_value = Some(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        best_value
     }
 }
 
@@ -139,16 +161,25 @@ impl KvStore {
 async fn main() {
     let args: Vec<String> = env::args().collect();
 
+    if args.len() < 4 {
+        println!("Usage:");
+        println!("{} <port> <self_node> <node1> <node2> ...", args[0]);
+        return;
+    }
+
     let port: u16 = args[1].parse().unwrap();
-    let nodes: Vec<String> = args[2..].to_vec();
+    let node_address = args[2].clone();
+    let nodes: Vec<String> = args[3..].to_vec();
 
     let log_file = format!("data_{}.log", port);
 
-    println!("[Node {}] Nodes: {:?}", port, nodes);
+    println!("[Node {}] Self: {}", port, node_address);
+    println!("[Node {}] Cluster: {:?}", port, nodes);
 
-    let kv = KvStore::new(&log_file, nodes.clone(), port);
+    let kv = KvStore::new(&log_file, nodes.clone(), port, node_address);
     let kv_filter = warp::any().map(move || kv.clone());
 
+    // PUT
     let put = warp::path("put")
         .and(warp::query::<HashMap<String, String>>())
         .and(kv_filter.clone())
@@ -161,17 +192,22 @@ async fn main() {
             }
         });
 
+    // ✅ UPDATED GET (async)
     let get = warp::path("get")
         .and(warp::query::<HashMap<String, String>>())
         .and(kv_filter.clone())
-        .map(|params: HashMap<String, String>, kv: KvStore| {
+        .and_then(|params: HashMap<String, String>, kv: KvStore| async move {
             if let Some(k) = params.get("key") {
-                kv.get(k.clone()).unwrap_or("Not found".to_string())
+                match kv.get(k.clone()).await {
+                    Some(val) => Ok::<_, warp::Rejection>(val),
+                    None => Ok("Not found".to_string()),
+                }
             } else {
-                "error".to_string()
+                Ok("error".to_string())
             }
         });
 
+    // REPLICATION
     let replicate = warp::path("replicate")
         .and(warp::query::<HashMap<String, String>>())
         .and(kv_filter.clone())
@@ -187,7 +223,21 @@ async fn main() {
             "OK"
         });
 
-    let routes = put.or(get).or(replicate);
+    // ✅ INTERNAL READ (for replicas)
+    let internal_get = warp::path("internal_get")
+        .and(warp::query::<HashMap<String, String>>())
+        .and(kv_filter.clone())
+        .map(|params: HashMap<String, String>, kv: KvStore| {
+            if let Some(k) = params.get("key") {
+                let store = kv.store.lock().unwrap();
+                if let Some((v, ts)) = store.get(k) {
+                    return format!("{}|{}", v, ts);
+                }
+            }
+            "none|0".to_string()
+        });
+
+    let routes = put.or(get).or(replicate).or(internal_get);
 
     println!("[Node {}] Server running", port);
 

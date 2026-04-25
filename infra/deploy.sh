@@ -18,36 +18,39 @@ echo $NODE_LIST
 for ((i=0; i<N; i++)); do
   PUBLIC=${PUBLIC_IPS[$i]}
   PRIVATE=${PRIVATE_IPS[$i]}
+  SELF="http://${PRIVATE}:3030"
 
   echo "Deploying node $i ($PUBLIC)"
 
-  ssh -o StrictHostKeyChecking=no -i $KEY ubuntu@$PUBLIC "
-    set -e
+  ssh -o StrictHostKeyChecking=no -i $KEY ubuntu@$PUBLIC << EOF
+set -e
 
-    sudo apt update -y
-    sudo apt install -y git curl build-essential pkg-config libssl-dev
+sudo apt update -y
+sudo apt install -y git curl build-essential pkg-config libssl-dev
 
-    if [ ! -d \"\$HOME/.cargo\" ]; then
-      curl https://sh.rustup.rs -sSf | sh -s -- -y
-    fi
+# install rust if not exists
+if [ ! -d "/home/ubuntu/.cargo" ]; then
+  curl https://sh.rustup.rs -sSf | sh -s -- -y
+fi
 
-    source \$HOME/.cargo/env
+/home/ubuntu/.cargo/bin/cargo --version || { echo "Cargo install failed"; exit 1; }
 
-    if [ ! -d distributed-key-value-store ]; then
-      git clone https://github.com/dev372k/distributed-key-value-store.git
-    fi
+rm -rf distributed-key-value-store
+git clone https://github.com/dev372k/distributed-key-value-store.git
 
-    cd distributed-key-value-store
-    git pull
+cd distributed-key-value-store
 
-    cargo build --release
+/home/ubuntu/.cargo/bin/cargo build --release
 
-    pkill kv_store || true
+pkill kv_store || true
 
-    nohup ./target/release/kv_store 3030 $NODE_LIST > log.txt 2>&1 &
-  " &
+nohup ./target/release/kv_store 3030 $SELF $NODE_LIST > log.txt 2>&1 &
+
+sleep 2
+echo "===== NODE LOG ====="
+cat log.txt
+EOF
 
 done
 
-wait
 echo "Cluster deployed successfully!"
