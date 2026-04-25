@@ -6,22 +6,36 @@ use warp::Filter;
 use std::env;
 use tokio::time::{timeout, Duration};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
+
+// ---------------- HASH FUNCTION ----------------
+fn hash_str(input: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    hasher.finish()
+}
 
 #[derive(Clone)]
 struct KvStore {
     store: Arc<Mutex<HashMap<String, (String, u128)>>>,
     log_file: String,
-    replicas: Vec<String>,
+    nodes: Vec<String>,   // all nodes
     port: u16,
+    node_id: u64,
 }
 
 impl KvStore {
-    fn new(log_file: &str, replicas: Vec<String>, port: u16) -> Self {
+    fn new(log_file: &str, nodes: Vec<String>, port: u16) -> Self {
+        let address = format!("http://127.0.0.1:{}", port);
+        let node_id = hash_str(&address);
+
         let kv = KvStore {
             store: Arc::new(Mutex::new(HashMap::new())),
             log_file: log_file.to_string(),
-            replicas,
+            nodes,
             port,
+            node_id,
         };
 
         kv.load();
@@ -29,26 +43,22 @@ impl KvStore {
     }
 
     fn load(&self) {
-        let file = OpenOptions::new().read(true).open(&self.log_file);
-
-        if let Ok(file) = file {
+        if let Ok(file) = OpenOptions::new().read(true).open(&self.log_file) {
             let reader = BufReader::new(file);
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
 
-            for line in reader.lines() {
-                if let Ok(cmd) = line {
-                    let parts: Vec<&str> = cmd.split_whitespace().collect();
+            for line in reader.lines().flatten() {
+                let parts: Vec<&str> = line.split_whitespace().collect();
 
-                    match parts.get(0) {
-                        Some(&"PUT") if parts.len() == 4 => {
-                            let ts: u128 = parts[3].parse().unwrap_or(0);
-                            store.insert(parts[1].to_string(), (parts[2].to_string(), ts));
-                        }
-                        Some(&"DELETE") if parts.len() == 2 => {
-                            store.remove(parts[1]);
-                        }
-                        _ => {}
+                match parts.get(0) {
+                    Some(&"PUT") if parts.len() == 4 => {
+                        let ts: u128 = parts[3].parse().unwrap_or(0);
+                        store.insert(parts[1].to_string(), (parts[2].to_string(), ts));
                     }
+                    Some(&"DELETE") if parts.len() == 2 => {
+                        store.remove(parts[1]);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -64,7 +74,43 @@ impl KvStore {
         writeln!(file, "{}", command).unwrap();
     }
 
+    // ---------------- CONSISTENT HASHING ----------------
+    fn find_node(&self, key: &str) -> String {
+        let mut ring: Vec<(u64, String)> = self
+            .nodes
+            .iter()
+            .map(|n| (hash_str(n), n.clone()))
+            .collect();
+
+        ring.sort_by_key(|k| k.0);
+
+        let key_hash = hash_str(key);
+
+        for (node_hash, node) in &ring {
+            if *node_hash >= key_hash {
+                return node.clone();
+            }
+        }
+
+        ring[0].1.clone()
+    }
+
+    // ---------------- PUT WITH ROUTING ----------------
     async fn put(&self, key: String, value: String) {
+        let responsible = self.find_node(&key);
+        let my_address = format!("http://127.0.0.1:{}", self.port);
+
+        if responsible != my_address {
+            println!(
+                "[Node {}] Forwarding key={} to {}",
+                self.port, key, responsible
+            );
+
+            let url = format!("{}/put?key={}&value={}", responsible, key, value);
+            let _ = reqwest::get(&url).await;
+            return;
+        }
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -74,23 +120,18 @@ impl KvStore {
             let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
 
             match store.get(&key) {
-                Some((_, existing_ts)) if *existing_ts > timestamp => {
-                    println!("[Node {}] Ignored older write for key={}", self.port, key);
-                    return;
-                }
+                Some((_, existing_ts)) if *existing_ts > timestamp => return,
                 _ => {
                     store.insert(key.clone(), (value.clone(), timestamp));
                     self.log(&format!("PUT {} {} {}", key, value, timestamp));
 
                     println!(
-                        "[Node {}] PUT key={} value={} ts={}",
-                        self.port, key, value, timestamp
+                        "[Node {}] (OWNER) PUT key={} value={}",
+                        self.port, key, value
                     );
                 }
             }
         }
-
-        self.replicate(&key, &value, timestamp).await;
     }
 
     fn get(&self, key: String) -> Option<String> {
@@ -105,24 +146,6 @@ impl KvStore {
 
         println!("[Node {}] DELETE key={}", self.port, key);
     }
-
-    async fn replicate(&self, key: &str, value: &str, timestamp: u128) {
-        for replica in &self.replicas {
-            println!("[Node {}] Replicating to {}", self.port, replica);
-
-            let url = format!(
-                "{}/replicate?key={}&value={}&ts={}",
-                replica, key, value, timestamp
-            );
-
-            let result = timeout(Duration::from_secs(2), reqwest::get(&url)).await;
-
-            match result {
-                Ok(Ok(_)) => println!("[Node {}] Replicated to {}", self.port, replica),
-                _ => println!("[Node {}] Failed to replicate to {}", self.port, replica),
-            }
-        }
-    }
 }
 
 #[tokio::main]
@@ -130,29 +153,26 @@ async fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        println!("Usage: {} <port> [replica1 replica2 ...]", args[0]);
+        println!("Usage: {} <port> [node1 node2 ...]", args[0]);
         return;
     }
 
-    let port: u16 = args[1].parse().expect("Invalid port");
+    let port: u16 = args[1].parse().unwrap();
 
-    let log_file = format!("data_{}.log", port);
-
-    let replicas: Vec<String> = if args.len() > 2 {
+    let nodes: Vec<String> = if args.len() > 2 {
         args[2..].to_vec()
     } else {
         vec![]
     };
 
-    println!("[Node {}] Replicas: {:?}", port, replicas);
+    let log_file = format!("data_{}.log", port);
 
-    let kv = KvStore::new(&log_file, replicas, port);
+    println!("[Node {}] Nodes: {:?}", port, nodes);
 
-    let kv_for_filter = kv.clone();
-    let kv_clone = kv.clone();
+    let kv = KvStore::new(&log_file, nodes.clone(), port);
+    let kv_filter = warp::any().map(move || kv.clone());
 
-    let kv_filter = warp::any().map(move || kv_for_filter.clone());
-
+    // PUT
     let put = warp::path("put")
         .and(warp::query::<HashMap<String, String>>())
         .and(kv_filter.clone())
@@ -165,6 +185,7 @@ async fn main() {
             }
         });
 
+    // GET
     let get = warp::path("get")
         .and(warp::query::<HashMap<String, String>>())
         .and(kv_filter.clone())
@@ -179,100 +200,7 @@ async fn main() {
             }
         });
 
-    let delete = warp::path("delete")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .map(|params: HashMap<String, String>, kv: KvStore| {
-            if let Some(key) = params.get("key") {
-                kv.delete(key.clone());
-                format!("Deleted {}", key)
-            } else {
-                "Missing key".to_string()
-            }
-        });
-
-    let replicate = warp::path("replicate")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .map(|params: HashMap<String, String>, kv: KvStore| {
-            if let (Some(key), Some(value), Some(ts)) =
-                (params.get("key"), params.get("value"), params.get("ts"))
-            {
-                let timestamp: u128 = ts.parse().unwrap_or(0);
-
-                let mut store = kv.store.lock().unwrap_or_else(|e| e.into_inner());
-
-                match store.get(key) {
-                    Some((_, existing_ts)) if *existing_ts > timestamp => {}
-                    _ => {
-                        store.insert(key.clone(), (value.clone(), timestamp));
-                        kv.log(&format!("PUT {} {} {}", key, value, timestamp));
-
-                        println!(
-                            "[Node {}] Received replication key={} value={}",
-                            kv.port, key, value
-                        );
-                    }
-                }
-
-                format!("Replicated {}={}", key, value)
-            } else {
-                "Missing key/value".to_string()
-            }
-        });
-
-    let all = warp::path("all")
-        .and(kv_filter.clone())
-        .map(|kv: KvStore| {
-            let store = kv.store.lock().unwrap_or_else(|e| e.into_inner());
-            serde_json::to_string(&*store).unwrap()
-        });
-
-    let routes = put.or(get).or(delete).or(replicate).or(all);
-
-    tokio::spawn(async move {
-        loop {
-            for replica in &kv_clone.replicas {
-                let url = format!("{}/all", replica);
-
-                println!("[Node {}] Syncing from {}", kv_clone.port, replica);
-
-                if let Ok(resp) = reqwest::get(&url).await {
-                    if let Ok(text) = resp.text().await {
-                        if let Ok(remote_store) = serde_json::from_str::<
-                            HashMap<String, (String, u128)>
-                        >(&text)
-                        {
-                            let mut local =
-                                kv_clone.store.lock().unwrap_or_else(|e| e.into_inner());
-
-                            for (key, (value, ts)) in remote_store {
-                                match local.get(&key) {
-                                    Some((_, local_ts)) if *local_ts >= ts => {}
-                                    Some(_) => {
-                                        local.insert(key.clone(), (value.clone(), ts));
-                                        println!(
-                                            "[Node {}] Updated key={} value={}",
-                                            kv_clone.port, key, value
-                                        );
-                                    }
-                                    None => {
-                                        local.insert(key.clone(), (value.clone(), ts));
-                                        println!(
-                                            "[Node {}] Added key={} value={}",
-                                            kv_clone.port, key, value
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        }
-    });
+    let routes = put.or(get);
 
     println!("[Node {}] Server running", port);
 
