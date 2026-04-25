@@ -3,7 +3,7 @@ variable "region" {
 }
 
 variable "instance_count" {
-  default = 9
+  default = 3
 }
 
 variable "instance_type" {
