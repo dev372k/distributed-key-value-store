@@ -135,28 +135,42 @@ impl KvStore {
         }
     }
 
-    // Quorum-style GET (latest timestamp wins)
+    // GET (latest timestamp wins)
     async fn get(&self, key: String) -> Option<String> {
         let nodes = self.find_nodes(&key);
 
+        // Create async requests (but don't await yet)
+        let requests = nodes.iter().map(|node| {
+            let url = format!("{}/internal_get?key={}", node, key);
+            async move {
+                match reqwest::get(&url).await {
+                    Ok(resp) => match resp.text().await {
+                        Ok(text) => Some(text),
+                        Err(_) => None,
+                    },
+                    Err(_) => None,
+                }
+            }
+        });
+
+        // Run all requests in parallel
+        let results = join_all(requests).await;
+
+        // Pick latest value
         let mut best_value: Option<String> = None;
         let mut best_ts: u128 = 0;
 
-        for node in nodes {
-            let url = format!("{}/internal_get?key={}", node, key);
+        for result in results {
+            if let Some(text) = result {
+                let parts: Vec<&str> = text.split("|").collect();
 
-            if let Ok(resp) = reqwest::get(&url).await {
-                if let Ok(text) = resp.text().await {
-                    let parts: Vec<&str> = text.split("|").collect();
+                if parts.len() == 2 {
+                    let value = parts[0];
+                    let ts: u128 = parts[1].parse().unwrap_or(0);
 
-                    if parts.len() == 2 {
-                        let value = parts[0];
-                        let ts: u128 = parts[1].parse().unwrap_or(0);
-
-                        if ts > best_ts {
-                            best_ts = ts;
-                            best_value = Some(value.to_string());
-                        }
+                    if ts > best_ts {
+                        best_ts = ts;
+                        best_value = Some(value.to_string());
                     }
                 }
             }
