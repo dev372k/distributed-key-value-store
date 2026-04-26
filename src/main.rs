@@ -7,6 +7,7 @@ use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::hash::{Hash, Hasher};
 use std::collections::hash_map::DefaultHasher;
+use futures::future::join_all;
 use tokio::time::{sleep, Duration};
 
 // ---------------- HASH FUNCTION ----------------
@@ -162,7 +163,7 @@ impl KvStore {
 
         for result in results {
             if let Some(text) = result {
-                let parts: Vec<&str> = text.split("|").collect();
+                let parts: Vec<&str> = text.as_str().split('|').collect();
 
                 if parts.len() == 2 {
                     let value = parts[0];
