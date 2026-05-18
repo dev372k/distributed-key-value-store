@@ -8,17 +8,24 @@ TOTAL_KEYS = 100_000
 VALUE_SIZE = 102400   # 100 KB
 CONCURRENT_REQUESTS = 150
 
-NODES = [
-    "http://98.93.215.234:3030",
-    "http://18.212.81.37:3030",
-    "http://34.203.234.139:3030",
-    "http://54.84.251.236:3030",
-    "http://54.172.41.150:3030",
-    "http://54.160.179.216:3030",
-    "http://54.147.188.78:3030",
-    "http://107.23.125.249:3030",
-    "http://98.91.28.202:3030"
-]
+# ---------------- LOAD IPS ----------------
+
+NODES = []
+
+with open("../public_ips.txt") as f:
+
+    for line in f:
+
+        ip = line.strip()
+
+        if ip:
+            NODES.append(f"http://{ip}:3030")
+
+print("Loaded nodes:")
+for n in NODES:
+    print(n)
+
+# ---------------- GENERATE VALUE ----------------
 
 value = ''.join(
     random.choices(
@@ -46,7 +53,6 @@ async def put_key(session, idx):
 
     node = random.choice(NODES)
 
-    # Retry logic
     for attempt in range(3):
 
         try:
@@ -97,7 +103,7 @@ async def worker(session):
 
         await put_key(session, idx)
 
-# ---------------- PROGRESS MONITOR ----------------
+# ---------------- PROGRESS ----------------
 
 async def progress_monitor(start_time):
 
