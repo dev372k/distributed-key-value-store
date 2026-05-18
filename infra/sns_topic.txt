@@ -1,0 +1,1 @@
+arn:aws:sns:us-east-1:722375709301:kv-replication-topic

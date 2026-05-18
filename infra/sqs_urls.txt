@@ -1,0 +1,9 @@
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-0
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-1
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-2
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-3
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-4
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-5
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-6
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-7
+https://sqs.us-east-1.amazonaws.com/722375709301/kv-queue-8
