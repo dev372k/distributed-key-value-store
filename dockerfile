@@ -1,24 +1,34 @@
-FROM rust:latest AS builder
+# ---------------- Builder Stage ----------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /install
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+COPY main/requirements.txt .
+
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
+# ---------------- Final Stage ----------------
+FROM python:3.11-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
-RUN rustup target add x86_64-unknown-linux-musl
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release --target x86_64-unknown-linux-musl
-RUN rm -rf src
+# Copy installed packages
+COPY --from=builder /install /usr/local
 
-COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+# Copy application
+COPY main/app.py .
 
-FROM alpine:latest
+# Persistent storage
+RUN mkdir -p /app/data
 
-WORKDIR /output
+EXPOSE 3030
 
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/kv_store ./kv_store
-
-RUN chmod +x kv_store
-
-CMD ["./kv_store"]
+# Multi-worker async server
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3030"]
+# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3030", "--workers", "8"]
