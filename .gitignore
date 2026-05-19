@@ -20,7 +20,7 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 infra/terraform.tfstate.backup
-infra/.terraform/providers/registry.terraform.io/hashicorp/aws/6.42.0/darwin_arm64/LICENSE.txt
-infra/.terraform/providers/registry.terraform.io/hashicorp/aws/6.42.0/darwin_arm64/terraform-provider-aws_v6.42.0_x5
+infra/.terraform/
+infra/.DS_Store
 infra/.terraform.lock.hcl
 infra/terraform.tfstate
