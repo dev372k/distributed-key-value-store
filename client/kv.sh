@@ -140,7 +140,7 @@ put)
 
   TARGET_NODE=$(get_primary_node "$KEY")
 
-  echo "Target node: $TARGET_NODE"
+  # echo "Target node: $TARGET_NODE"
 
   curl -s \
     "http://$TARGET_NODE:3030/put?key=$KEY&value=$VALUE"
@@ -163,7 +163,7 @@ get)
 
   PRIMARY=$(get_primary_node "$KEY")
 
-  echo "Primary node: $PRIMARY"
+  # echo "Primary node: $PRIMARY"
 
   response=$(curl -s --max-time 2 \
     "http://$PRIMARY:3030/get?key=$KEY")
