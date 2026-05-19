@@ -1,262 +1,371 @@
-use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::{Write, BufRead, BufReader};
-use std::sync::{Arc, Mutex};
-use warp::Filter;
-use std::env;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::hash::{Hash, Hasher};
-use std::collections::hash_map::DefaultHasher;
-use futures::future::join_all;
-use tokio::time::Duration;
-use reqwest::Client;
+use axum::{
+    extract::Query,
+    routing::{get, post},
+    Json, Router,
+};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha1::{Digest, Sha1};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    sync::Arc,
+};
+use tokio::sync::RwLock;
 
-// ---------------- HASH FUNCTION ----------------
-fn hash_str(input: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    hasher.finish()
+#[derive(Clone, Serialize, Deserialize)]
+struct ValueEntry {
+    value: String,
+    ts: u128,
 }
 
 #[derive(Clone)]
-struct KvStore {
-    store: Arc<Mutex<HashMap<String, (String, u128)>>>,
-    log_file: String,
+struct AppState {
+    store: Arc<RwLock<HashMap<String, ValueEntry>>>,
+    ring: Arc<RwLock<Vec<(u64, String)>>>,
     nodes: Vec<String>,
-    node_address: String,
-    client: Client,
+    my_ip: String,
 }
 
-impl KvStore {
-    fn new(log_file: &str, nodes: Vec<String>, node_address: String) -> Self {
-        let kv = KvStore {
-            store: Arc::new(Mutex::new(HashMap::new())),
-            log_file: log_file.to_string(),
-            nodes,
-            node_address,
-            client: Client::builder()
-                .timeout(Duration::from_secs(2)) // safer timeout
-                .build()
-                .unwrap(),
-        };
+static REPLICATION_FACTOR: usize = 3;
 
-        kv.load();
-        kv
+#[derive(Deserialize)]
+struct PutParams {
+    key: String,
+    value: String,
+}
+
+#[derive(Deserialize)]
+struct GetParams {
+    key: String,
+}
+
+fn hash_key(key: &str) -> u64 {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+
+    let result = hasher.finalize();
+
+    let bytes: [u8; 8] = result[..8].try_into().unwrap();
+
+    u64::from_be_bytes(bytes)
+}
+
+async fn build_ring(nodes: Vec<String>) -> Vec<(u64, String)> {
+    let mut ring = vec![];
+
+    for node in nodes {
+        ring.push((hash_key(&node), node));
     }
 
-    fn load(&self) {
-        if let Ok(file) = OpenOptions::new().read(true).open(&self.log_file) {
-            let reader = BufReader::new(file);
-            let mut store = self.store.lock().unwrap();
+    ring.sort_by_key(|x| x.0);
 
-            for line in reader.lines().flatten() {
-                let parts: Vec<&str> = line.split_whitespace().collect();
+    ring
+}
 
-                if parts.len() == 4 && parts[0] == "PUT" {
-                    let ts: u128 = parts[3].parse().unwrap_or(0);
-                    store.insert(parts[1].to_string(), (parts[2].to_string(), ts));
-                }
+async fn get_replicas(
+    state: &AppState,
+    key: &str,
+) -> Vec<String> {
+    let ring = state.ring.read().await;
+
+    if ring.is_empty() {
+        return vec![];
+    }
+
+    let h = hash_key(key);
+
+    let mut idx = 0;
+
+    for (i, (node_hash, _)) in ring.iter().enumerate() {
+        if *node_hash >= h {
+            idx = i;
+            break;
+        }
+    }
+
+    let mut replicas = vec![];
+
+    for i in 0..REPLICATION_FACTOR {
+        let node = ring[(idx + i) % ring.len()].1.clone();
+        replicas.push(node);
+    }
+
+    replicas
+}
+
+async fn put(
+    Query(params): Query<PutParams>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<serde_json::Value> {
+
+    let replicas = get_replicas(&state, &params.key).await;
+
+    if replicas.is_empty() {
+        return Json(json!({
+            "error": "no replicas"
+        }));
+    }
+
+    let primary = replicas[0].clone();
+
+    // forward if not primary
+    if state.my_ip != primary {
+
+        let url = format!(
+            "http://{}:3030/put?key={}&value={}",
+            primary,
+            params.key,
+            params.value
+        );
+
+        match reqwest::get(url).await {
+            Ok(resp) => {
+                let body: serde_json::Value =
+                    resp.json().await.unwrap();
+
+                return Json(body);
+            }
+
+            Err(_) => {
+                return Json(json!({
+                    "error": "primary unreachable"
+                }));
             }
         }
     }
 
-    fn log(&self, command: &str) {
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file)
-        {
-            let _ = writeln!(file, "{}", command);
-        }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    {
+        let mut store = state.store.write().await;
+
+        store.insert(
+            params.key.clone(),
+            ValueEntry {
+                value: params.value.clone(),
+                ts,
+            },
+        );
     }
 
-    fn sorted_ring(&self) -> Vec<(u64, String)> {
-        let mut ring: Vec<(u64, String)> = self
-            .nodes
-            .iter()
-            .map(|n| (hash_str(n), n.clone()))
-            .collect();
+    // async replication
+    for replica in replicas.iter().skip(1) {
 
-        ring.sort_by_key(|k| k.0);
-        ring
-    }
+        let replica = replica.clone();
 
-    fn find_nodes(&self, key: &str) -> Vec<String> {
-        let ring = self.sorted_ring();
-        let key_hash = hash_str(key);
+        let key = params.key.clone();
+        let value = params.value.clone();
 
-        for (i, (node_hash, _)) in ring.iter().enumerate() {
-            if *node_hash >= key_hash {
-                return (0..3)
-                    .map(|j| ring[(i + j) % ring.len()].1.clone())
-                    .collect();
-            }
-        }
+        tokio::spawn(async move {
 
-        (0..3).map(|i| ring[i].1.clone()).collect()
-    }
+            let client = reqwest::Client::new();
 
-    async fn put(&self, key: String, value: String) {
-        let nodes = self.find_nodes(&key);
-        let primary = &nodes[0];
-
-        if &self.node_address != primary {
-            let url = format!("{}/put?key={}&value={}", primary, key, value);
-            let _ = self.client.get(&url).send().await;
-            return;
-        }
-
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-
-        {
-            let mut store = self.store.lock().unwrap();
-            store.insert(key.clone(), (value.clone(), ts));
-            self.log(&format!("PUT {} {} {}", key, value, ts));
-        }
-
-        for replica in nodes.iter().skip(1) {
-            let url = format!(
-                "{}/replicate?key={}&value={}&ts={}",
-                replica, key, value, ts
-            );
-            let _ = self.client.get(&url).send().await;
-        }
-    }
-
-    async fn get(&self, key: String) -> Option<String> {
-        let nodes = self.find_nodes(&key);
-
-        let requests = nodes.iter().map(|node| {
-            let client = self.client.clone();
-            let url = format!("{}/internal_get?key={}", node, key);
-
-            async move {
-                match client.get(&url).send().await {
-                    Ok(resp) => resp.text().await.ok(),
-                    Err(_) => None,
-                }
-            }
+            let _ = client
+                .post(format!(
+                    "http://{}:3030/internal_put",
+                    replica
+                ))
+                .json(&json!({
+                    "key": key,
+                    "value": value,
+                    "ts": ts
+                }))
+                .send()
+                .await;
         });
+    }
 
-        let results = join_all(requests).await;
+    Json(json!({
+        "status": "ok",
+        "primary": primary,
+        "replicas": replicas
+    }))
+}
 
-        let mut best_value: Option<String> = None;
-        let mut best_ts: u128 = 0;
+async fn get_key(
+    Query(params): Query<GetParams>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<serde_json::Value> {
 
-        for result in results {
-            if let Some(text) = result {
-                let parts: Vec<&str> = text.split('|').collect();
+    let replicas = get_replicas(&state, &params.key).await;
 
-                if parts.len() == 2 {
-                    let ts: u128 = parts[1].parse().unwrap_or(0);
+    let mut latest: Option<ValueEntry> = None;
 
-                    if ts > best_ts {
-                        best_ts = ts;
-                        best_value = Some(parts[0].to_string());
-                    }
+    // local-first optimization
+    {
+        let store = state.store.read().await;
+
+        if let Some(v) = store.get(&params.key) {
+            latest = Some(v.clone());
+        }
+    }
+
+    // parallel replica reads
+    let mut tasks = vec![];
+
+    for node in replicas {
+
+        let key = params.key.clone();
+
+        tasks.push(tokio::spawn(async move {
+
+            let url = format!(
+                "http://{}:3030/local_get?key={}",
+                node,
+                key
+            );
+
+            match reqwest::get(url).await {
+
+                Ok(resp) => {
+                    resp.json::<ValueEntry>().await.ok()
                 }
+
+                Err(_) => None,
+            }
+        }));
+    }
+
+    for task in tasks {
+
+        if let Ok(Some(v)) = task.await {
+
+            if latest.is_none()
+                || v.ts > latest.as_ref().unwrap().ts
+            {
+                latest = Some(v);
             }
         }
-
-        best_value
     }
+
+    match latest {
+        Some(v) => Json(json!({
+            "value": v.value,
+            "ts": v.ts
+        })),
+
+        None => Json(json!({
+            "error": "not found"
+        })),
+    }
+}
+
+async fn local_get(
+    Query(params): Query<GetParams>,
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<serde_json::Value> {
+
+    let store = state.store.read().await;
+
+    match store.get(&params.key) {
+
+        Some(v) => Json(json!(v)),
+
+        None => Json(json!({
+            "error": "not found"
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+struct InternalPut {
+    key: String,
+    value: String,
+    ts: u128,
+}
+
+async fn internal_put(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    Json(data): Json<InternalPut>,
+) -> Json<serde_json::Value> {
+
+    let mut store = state.store.write().await;
+
+    let update = match store.get(&data.key) {
+        Some(v) => data.ts > v.ts,
+        None => true,
+    };
+
+    if update {
+
+        store.insert(
+            data.key.clone(),
+            ValueEntry {
+                value: data.value.clone(),
+                ts: data.ts,
+            },
+        );
+    }
+
+    Json(json!({
+        "status": "replicated"
+    }))
+}
+
+async fn health() -> Json<serde_json::Value> {
+    Json(json!({
+        "status": "ok"
+    }))
+}
+
+async fn dump(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Json<HashMap<String, ValueEntry>> {
+
+    let store = state.store.read().await;
+
+    Json(store.clone())
 }
 
 #[tokio::main]
 async fn main() {
-    println!("🚀 STARTING KV NODE");
 
-    let args: Vec<String> = env::args().collect();
-    println!("ARGS: {:?}", args);
+    let node_list =
+        env::var("NODE_LIST").unwrap_or_default();
 
-    if args.len() < 4 {
-        eprintln!("Usage: {} <port> <self_node> <nodes...>", args[0]);
-        return;
-    }
+    let my_ip =
+        env::var("MY_IP").unwrap_or("node1".to_string());
 
-    // SAFE PARSE
-    let port: u16 = match args[1].parse() {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("Invalid port");
-            return;
-        }
+    let nodes: Vec<String> = node_list
+        .split(',')
+        .map(|s| s.to_string())
+        .collect();
+
+    let ring = build_ring(nodes.clone()).await;
+
+    let state = AppState {
+        store: Arc::new(RwLock::new(HashMap::new())),
+        ring: Arc::new(RwLock::new(ring)),
+        nodes,
+        my_ip,
     };
 
-    let node_address = args[2].clone();
+    println!("Starting node: {}", state.my_ip);
 
-    let mut nodes: Vec<String> = args[3..].to_vec();
-    nodes.sort();
-    nodes.dedup();
+    let app = Router::new()
+        .route("/put", get(put))
+        .route("/get", get(get_key))
+        .route("/local_get", get(local_get))
+        .route("/internal_put", post(internal_put))
+        .route("/dump", get(dump))
+        .route("/health", get(health))
+        .with_state(state);
 
-    println!("SELF: {}", node_address);
-    println!("CLUSTER: {:?}", nodes);
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3030));
 
-    let log_file = format!("data_{}.log", port);
-    let kv = KvStore::new(&log_file, nodes.clone(), node_address);
+    println!("Listening on {}", addr);
 
-    let kv_filter = warp::any().map(move || kv.clone());
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .unwrap();
 
-    let put = warp::path("put")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .and_then(|params: HashMap<String, String>, kv: KvStore| async move {
-            if let (Some(k), Some(v)) = (params.get("key"), params.get("value")) {
-                kv.put(k.clone(), v.clone()).await;
-                Ok::<_, warp::Rejection>("OK".to_string())
-            } else {
-                Ok("error".to_string())
-            }
-        });
-
-    let get = warp::path("get")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .and_then(|params: HashMap<String, String>, kv: KvStore| async move {
-            if let Some(k) = params.get("key") {
-                match kv.get(k.clone()).await {
-                    Some(val) => Ok::<_, warp::Rejection>(val),
-                    None => Ok("Not found".to_string()),
-                }
-            } else {
-                Ok("error".to_string())
-            }
-        });
-
-    let replicate = warp::path("replicate")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .map(|params: HashMap<String, String>, kv: KvStore| {
-            if let (Some(k), Some(v), Some(ts)) =
-                (params.get("key"), params.get("value"), params.get("ts"))
-            {
-                let ts: u128 = ts.parse().unwrap_or(0);
-                let mut store = kv.store.lock().unwrap();
-                store.insert(k.clone(), (v.clone(), ts));
-                kv.log(&format!("PUT {} {} {}", k, v, ts));
-            }
-            "OK"
-        });
-
-    let internal_get = warp::path("internal_get")
-        .and(warp::query::<HashMap<String, String>>())
-        .and(kv_filter.clone())
-        .map(|params: HashMap<String, String>, kv: KvStore| {
-            if let Some(k) = params.get("key") {
-                let store = kv.store.lock().unwrap();
-                if let Some((v, ts)) = store.get(k) {
-                    return format!("{}|{}", v, ts);
-                }
-            }
-            "none|0".to_string()
-        });
-
-    let routes = put.or(get).or(replicate).or(internal_get);
-
-    println!("SERVER RUNNING on port {}", port);
-
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    axum::serve(listener, app)
+        .await
+        .unwrap();
 }

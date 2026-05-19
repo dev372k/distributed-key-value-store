@@ -1,0 +1,93 @@
+version: "3.9"
+
+services:
+
+  node1:
+    build: .
+    container_name: node1
+    environment:
+      MY_IP: node1
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3031:3030"
+
+  node2:
+    build: .
+    container_name: node2
+    environment:
+      MY_IP: node2
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3032:3030"
+
+  node3:
+    build: .
+    container_name: node3
+    environment:
+      MY_IP: node3
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3033:3030"
+
+  node4:
+    build: .
+    container_name: node4
+    environment:
+      MY_IP: node4
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3034:3030"
+
+  node5:
+    build: .
+    container_name: node5
+    environment:
+      MY_IP: node5
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3035:3030"
+
+  node6:
+    build: .
+    container_name: node6
+    environment:
+      MY_IP: node6
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3036:3030"
+
+  node7:
+    build: .
+    container_name: node7
+    environment:
+      MY_IP: node7
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3037:3030"
+
+  node8:
+    build: .
+    container_name: node8
+    environment:
+      MY_IP: node8
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3038:3030"
+
+  node9:
+    build: .
+    container_name: node9
+    environment:
+      MY_IP: node9
+      PORT: 3030
+      NODE_LIST: "node1,node2,node3,node4,node5,node6,node7,node8,node9"
+    ports:
+      - "3039:3030"

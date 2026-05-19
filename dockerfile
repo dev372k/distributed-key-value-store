@@ -1,34 +1,25 @@
-# ---------------- Builder Stage ----------------
-FROM python:3.11-slim AS builder
-
-WORKDIR /install
-
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-COPY main/requirements.txt .
-
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
-
-# ---------------- Final Stage ----------------
-FROM python:3.11-slim
+FROM rust:1.88 as builder
 
 WORKDIR /app
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
+COPY . .
 
-# Copy installed packages
-COPY --from=builder /install /usr/local
+RUN cargo build --release
 
-# Copy application
-COPY main/app.py .
+# ================= RUNTIME =================
 
-# Persistent storage
-RUN mkdir -p /app/data
+FROM debian:bookworm-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    openssl \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/kv-node /usr/local/bin/kv-node
 
 EXPOSE 3030
 
-# Multi-worker async server
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3030"]
-# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "3030", "--workers", "8"]
+CMD ["kv-node"]
